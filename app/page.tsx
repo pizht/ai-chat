@@ -2,8 +2,10 @@
 
 import { useState, useRef, useEffect } from 'react';
 
+type Message = { role: 'user' | 'assistant'; content: string };
+
 export default function Home() {
-  const [messages, setMessages] = useState<{ role: 'user' | 'assistant'; content: string }[]>([]);
+  const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -18,11 +20,11 @@ export default function Home() {
   const handleSend = async () => {
     if (!input.trim()) return;
 
-    const newMessages = [...messages, { role: 'user', content: input }];
+    const newMessages: Message[] = [...messages, { role: 'user', content: input }];
     setMessages(newMessages);
     setInput('');
 
-    const messagesWithAssistant = [...newMessages, { role: 'assistant', content: '' }];
+    const messagesWithAssistant: Message[] = [...newMessages, { role: 'assistant', content: '' }];
     setMessages(messagesWithAssistant);
 
     try {
