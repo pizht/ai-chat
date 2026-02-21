@@ -1,8 +1,123 @@
-import { NextRequest } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
+import { getCurrentUser } from '@/lib/session';
+import { checkRateLimit, checkDailyLimit } from '@/lib/rate-limit';
+import { logChatRequest, logRateLimited, logDailyLimited, logRequestRejected } from '@/lib/logger';
+
+const MAX_MESSAGES = 20;
+const MAX_MESSAGE_LENGTH = 4000;
+const MAX_TOTAL_LENGTH = 50000;
+
+function validateMessages(messages: unknown): { valid: boolean; error?: string } {
+  if (!Array.isArray(messages)) {
+    return { valid: false, error: 'Messages must be an array' };
+  }
+
+  if (messages.length === 0) {
+    return { valid: false, error: 'Messages cannot be empty' };
+  }
+
+  if (messages.length > MAX_MESSAGES) {
+    return { valid: false, error: `Too many messages. Maximum is ${MAX_MESSAGES}` };
+  }
+
+  let totalLength = 0;
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+
+    if (!msg || typeof msg !== 'object') {
+      return { valid: false, error: `Invalid message at index ${i}` };
+    }
+
+    if (msg.role !== 'user' && msg.role !== 'assistant' && msg.role !== 'system') {
+      return { valid: false, error: `Invalid role at index ${i}. Must be 'user', 'assistant', or 'system'` };
+    }
+
+    if (typeof msg.content !== 'string') {
+      return { valid: false, error: `Invalid content at index ${i}. Must be a string` };
+    }
+
+    if (msg.content.length > MAX_MESSAGE_LENGTH) {
+      return { valid: false, error: `Message at index ${i} exceeds maximum length of ${MAX_MESSAGE_LENGTH} characters` };
+    }
+
+    totalLength += msg.content.length;
+  }
+
+  if (totalLength > MAX_TOTAL_LENGTH) {
+    return { valid: false, error: `Total message length exceeds maximum of ${MAX_TOTAL_LENGTH} characters` };
+  }
+
+  return { valid: true };
+}
+
+function estimateTokens(charCount: number): number {
+  return Math.ceil(charCount / 4);
+}
 
 export async function POST(request: NextRequest) {
   try {
-    const { messages } = await request.json();
+    const user = await getCurrentUser();
+
+    if (!user) {
+      return NextResponse.json(
+        { error: 'Unauthorized' },
+        { status: 401 }
+      );
+    }
+
+    const dailyLimitResult = checkDailyLimit(user.id);
+    if (!dailyLimitResult.allowed) {
+      logDailyLimited(user.id, { dailyCount: dailyLimitResult.count });
+      return NextResponse.json(
+        { error: 'Daily limit exceeded. Please try again tomorrow.' },
+        { 
+          status: 429,
+          headers: {
+            'X-DailyLimit-Limit': dailyLimitResult.limit.toString(),
+            'X-DailyLimit-Remaining': '0',
+            'X-DailyLimit-Used': dailyLimitResult.count.toString(),
+          }
+        }
+      );
+    }
+
+    const rateLimitResult = checkRateLimit(user.id);
+    if (!rateLimitResult.allowed) {
+      logRateLimited(user.id, { remainingTime: rateLimitResult.resetTime - Date.now() });
+      return NextResponse.json(
+        { error: 'Too many requests. Please try again later.' },
+        { 
+          status: 429,
+          headers: {
+            'X-RateLimit-Limit': '10',
+            'X-RateLimit-Remaining': '0',
+            'X-RateLimit-Reset': rateLimitResult.resetTime.toString(),
+          }
+        }
+      );
+    }
+
+    const body = await request.json();
+    const { messages } = body;
+
+    const validation = validateMessages(messages);
+    if (!validation.valid) {
+      logRequestRejected(user.id, { reason: 'validation_failed', error: validation.error || '' });
+      return NextResponse.json(
+        { error: validation.error },
+        { status: 400 }
+      );
+    }
+
+    const totalChars = (messages as Array<{ content: string }>).reduce((sum: number, msg) => sum + msg.content.length, 0);
+    const estimatedTokens = estimateTokens(totalChars);
+
+    logChatRequest(user.id, {
+      messageCount: (messages as unknown[]).length,
+      totalChars,
+      estimatedTokens,
+    });
 
     const response = await fetch('https://api.deepseek.com/chat/completions', {
       method: 'POST',
@@ -75,6 +190,12 @@ export async function POST(request: NextRequest) {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         Connection: 'keep-alive',
+        'X-RateLimit-Limit': '10',
+        'X-RateLimit-Remaining': rateLimitResult.remaining.toString(),
+        'X-RateLimit-Reset': rateLimitResult.resetTime.toString(),
+        'X-DailyLimit-Limit': dailyLimitResult.limit.toString(),
+        'X-DailyLimit-Remaining': dailyLimitResult.remaining.toString(),
+        'X-DailyLimit-Used': dailyLimitResult.count.toString(),
       },
     });
   } catch (error) {
