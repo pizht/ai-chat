@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getCurrentUser } from '@/lib/session';
 import { checkRateLimit, checkDailyLimit } from '@/lib/rate-limit';
 import { logChatRequest, logRateLimited, logDailyLimited, logRequestRejected } from '@/lib/logger';
+import { prisma } from '@/lib/prisma';
 
 const MAX_MESSAGES = 20;
 const MAX_MESSAGE_LENGTH = 4000;
@@ -60,10 +61,7 @@ export async function POST(request: NextRequest) {
     const user = await getCurrentUser();
 
     if (!user) {
-      return NextResponse.json(
-        { error: 'Unauthorized' },
-        { status: 401 }
-      );
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
     const dailyLimitResult = checkDailyLimit(user.id);
@@ -71,13 +69,13 @@ export async function POST(request: NextRequest) {
       logDailyLimited(user.id, { dailyCount: dailyLimitResult.count });
       return NextResponse.json(
         { error: 'Daily limit exceeded. Please try again tomorrow.' },
-        { 
+        {
           status: 429,
           headers: {
             'X-DailyLimit-Limit': dailyLimitResult.limit.toString(),
             'X-DailyLimit-Remaining': '0',
             'X-DailyLimit-Used': dailyLimitResult.count.toString(),
-          }
+          },
         }
       );
     }
@@ -87,30 +85,42 @@ export async function POST(request: NextRequest) {
       logRateLimited(user.id, { remainingTime: rateLimitResult.resetTime - Date.now() });
       return NextResponse.json(
         { error: 'Too many requests. Please try again later.' },
-        { 
+        {
           status: 429,
           headers: {
             'X-RateLimit-Limit': '10',
             'X-RateLimit-Remaining': '0',
             'X-RateLimit-Reset': rateLimitResult.resetTime.toString(),
-          }
+          },
         }
       );
     }
 
     const body = await request.json();
-    const { messages } = body;
+    const { messages, conversationId } = body;
+
+    if (!conversationId || typeof conversationId !== 'string') {
+      return NextResponse.json({ error: 'conversationId is required' }, { status: 400 });
+    }
+
+    const conversation = await prisma.conversation.findFirst({
+      where: { id: conversationId, userId: user.id },
+    });
+
+    if (!conversation) {
+      return NextResponse.json({ error: 'Conversation not found' }, { status: 404 });
+    }
 
     const validation = validateMessages(messages);
     if (!validation.valid) {
       logRequestRejected(user.id, { reason: 'validation_failed', error: validation.error || '' });
-      return NextResponse.json(
-        { error: validation.error },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: validation.error }, { status: 400 });
     }
 
-    const totalChars = (messages as Array<{ content: string }>).reduce((sum: number, msg) => sum + msg.content.length, 0);
+    const totalChars = (messages as Array<{ content: string }>).reduce(
+      (sum: number, msg) => sum + msg.content.length,
+      0
+    );
     const estimatedTokens = estimateTokens(totalChars);
 
     logChatRequest(user.id, {
@@ -118,6 +128,28 @@ export async function POST(request: NextRequest) {
       totalChars,
       estimatedTokens,
     });
+
+    const lastUserMessage = (messages as Array<{ role: string; content: string }>)
+      .filter((msg) => msg.role === 'user')
+      .pop();
+
+    if (lastUserMessage) {
+      await prisma.message.create({
+        data: {
+          conversationId,
+          role: 'user',
+          content: lastUserMessage.content,
+        },
+      });
+
+      if (!conversation.title) {
+        const title = lastUserMessage.content.slice(0, 30).trim() + (lastUserMessage.content.length > 30 ? '...' : '');
+        await prisma.conversation.update({
+          where: { id: conversationId },
+          data: { title },
+        });
+      }
+    }
 
     const response = await fetch('https://api.deepseek.com/chat/completions', {
       method: 'POST',
@@ -143,6 +175,8 @@ export async function POST(request: NextRequest) {
       throw new Error('No reader available');
     }
 
+    let assistantContent = '';
+
     const stream = new ReadableStream({
       async start(controller) {
         try {
@@ -150,6 +184,15 @@ export async function POST(request: NextRequest) {
             const { done, value } = await reader.read();
 
             if (done) {
+              if (assistantContent) {
+                await prisma.message.create({
+                  data: {
+                    conversationId,
+                    role: 'assistant',
+                    content: assistantContent,
+                  },
+                });
+              }
               controller.close();
               break;
             }
@@ -171,6 +214,7 @@ export async function POST(request: NextRequest) {
                   const content = parsed.choices?.[0]?.delta?.content;
 
                   if (content) {
+                    assistantContent += content;
                     controller.enqueue(encoder.encode(`data: ${JSON.stringify({ content })}\n\n`));
                   }
                 } catch {

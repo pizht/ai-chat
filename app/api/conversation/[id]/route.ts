@@ -1,0 +1,84 @@
+import { NextRequest, NextResponse } from 'next/server';
+import { getCurrentUser } from '@/lib/session';
+import { prisma } from '@/lib/prisma';
+
+export async function GET(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  try {
+    const user = await getCurrentUser();
+
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    const { id } = await params;
+
+    const conversation = await prisma.conversation.findFirst({
+      where: { id, userId: user.id },
+      include: {
+        messages: {
+          orderBy: { createdAt: 'asc' },
+          select: {
+            role: true,
+            content: true,
+          },
+        },
+      },
+    });
+
+    if (!conversation) {
+      return NextResponse.json({ error: 'Conversation not found' }, { status: 404 });
+    }
+
+    return NextResponse.json({
+      conversation: {
+        id: conversation.id,
+        title: conversation.title,
+        messages: conversation.messages,
+      },
+    });
+  } catch (error) {
+    console.error('Get conversation error:', error);
+    return NextResponse.json(
+      { error: 'Failed to get conversation' },
+      { status: 500 }
+    );
+  }
+}
+
+export async function DELETE(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  try {
+    const user = await getCurrentUser();
+
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+
+    const { id } = await params;
+
+    const conversation = await prisma.conversation.findFirst({
+      where: { id, userId: user.id },
+    });
+
+    if (!conversation) {
+      return NextResponse.json({ error: 'Conversation not found' }, { status: 404 });
+    }
+
+    await prisma.conversation.delete({
+      where: { id },
+    });
+
+    return NextResponse.json({ success: true });
+  } catch (error) {
+    console.error('Delete conversation error:', error);
+    return NextResponse.json(
+      { error: 'Failed to delete conversation' },
+      { status: 500 }
+    );
+  }
+}
