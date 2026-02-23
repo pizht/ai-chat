@@ -246,7 +246,7 @@ export default function HomeContent() {
   }
 
   return (
-    <div className="flex min-h-screen bg-zinc-50 font-sans dark:bg-black">
+    <div className="flex h-screen bg-zinc-50 font-sans dark:bg-black">
       {/* Sidebar */}
       <aside
         className={`${

@@ -143,11 +143,42 @@ export async function POST(request: NextRequest) {
       });
 
       if (!conversation.title) {
-        const title = lastUserMessage.content.slice(0, 30).trim() + (lastUserMessage.content.length > 30 ? '...' : '');
-        await prisma.conversation.update({
-          where: { id: conversationId },
-          data: { title },
-        });
+        try {
+          const titleResponse = await fetch('https://api.deepseek.com/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+            },
+            body: JSON.stringify({
+              model: 'deepseek-chat',
+              messages: [
+                {
+                  role: 'system',
+                  content: '你是一个标题生成助手。请根据用户的对话内容生成一个简短的标题（不超过20个字符）。只返回标题，不要包含其他内容。',
+                },
+                {
+                  role: 'user',
+                  content: `请为以下对话生成一个简短标题：\n\n${lastUserMessage.content}`,
+                },
+              ],
+              max_tokens: 30,
+            }),
+          });
+
+          if (titleResponse.ok) {
+            const titleData = await titleResponse.json();
+            const generatedTitle = titleData.choices?.[0]?.message?.content?.trim().slice(0, 30);
+            if (generatedTitle) {
+              await prisma.conversation.update({
+                where: { id: conversationId },
+                data: { title: generatedTitle },
+              });
+            }
+          }
+        } catch (error) {
+          console.error('Generate title error:', error);
+        }
       }
     }
 
